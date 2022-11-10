@@ -1,5 +1,9 @@
 /* GStreamer
- * Copyright (C) 2020 <song.zhao@amlogic.com>
+ * Some extracts from GStreamer Plugins Base, which is:
+ * Copyright (C) 1999,2000 Erik Walthinsen <omega@cse.ogi.edu>
+ * Copyright 2005 Wim Taymans <wim@fluendo.com>
+ * Copyright 2020 Amlogic, Inc.
+ * Here licensed under the GNU Lesser General Public License, version 2.1
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -42,10 +46,7 @@
 #include "aml_avsync.h"
 #include "aml_avsync_log.h"
 #include "aml_version.h"
-
-#ifdef MEDIA_SYNC
-#include "MediaSyncInterface.h"
-#endif
+#include "mediasync_wrap.h"
 
 #ifdef ESSOS_RM
 #include "essos-resmgr.h"
@@ -55,6 +56,8 @@
 #include "gstmetapesheader.h"
 #include "pes_private_data.h"
 #endif
+
+#define G_ATOMIC_LOCK_FREE
 
 GST_DEBUG_CATEGORY (gst_aml_hal_asink_debug_category);
 #define GST_CAT_DEFAULT gst_aml_hal_asink_debug_category
@@ -196,6 +199,7 @@ struct _GstAmlHalAsinkPrivate
   gboolean seamless_switch;
   gboolean tempo_disable; /* disable tempo use */
 
+  gboolean ms12_enable;
 #ifdef ENABLE_MS12
   /* ac4 config */
   int ac4_pres_group_idx;
@@ -268,14 +272,6 @@ enum
   SIGNAL_XRUN,
   SIGNAL_AUDSWITCH,
   MAX_SIGNAL
-};
-
-enum
-{
-  AV_SYNC_TYPE_NULL = 0,
-  AV_SYNC_TYPE_TSYNC = 1,
-  AV_SYNC_TYPE_MSYNC = 2,
-  AV_SYNC_TYPE_MEDIASYNC = 3,
 };
 
 #define COMMON_AUDIO_CAPS \
@@ -670,6 +666,7 @@ gst_aml_hal_asink_init (GstAmlHalAsink* sink)
   priv->sync_mode = AV_SYNC_MODE_AMASTER;
   priv->session_id = -1;
   priv->stream_volume = 1.0;
+  priv->ms12_enable = false;
 #ifdef ENABLE_MS12
   priv->ac4_pat = 255;
   priv->ac4_ass_type = 255;
@@ -760,12 +757,11 @@ static int avsync_get_time(GstAmlHalAsink* sink, pts90K *pts)
     int rc = 0;
     GstAmlHalAsinkPrivate *priv = sink->priv;
 
-    if (!priv->avsync) {
-        rc = -1;
-        goto exit;
+    if (!g_atomic_pointer_compare_and_exchange (&priv->avsync, NULL, NULL)) {
+      rc = av_sync_get_clock(priv->avsync, pts);
+    } else {
+      rc = -1;
     }
-
-    rc = av_sync_get_clock(priv->avsync, pts);
 
 exit:
     return rc;
@@ -795,60 +791,58 @@ get_position (GstAmlHalAsink* sink, GstFormat format, gint64 * cur)
     return TRUE;
   }
 
-  if (!priv->avsync) {
+  if (!priv->provided_clock) {
     //TODO(song): get HAL position
     *cur = gst_util_uint64_scale_int(priv->render_samples, GST_SECOND, priv->sr_);
-    GST_LOG_OBJECT (sink, "POSITION: %" GST_TIME_FORMAT, GST_TIME_ARGS (*cur));
-    if (GST_FORMAT_TIME != format) {
-      gboolean ret;
-
-      /* convert to final format */
-      ret = gst_audio_info_convert (&priv->spec.info, GST_FORMAT_TIME, *cur, format, cur);
-      if (!ret)
+  } else if (gst_aml_clock_get_clock_type(priv->provided_clock) == GST_AML_CLOCK_TYPE_MEDIASYNC) {
+    GstAmlClock *aclock = GST_AML_CLOCK_CAST(priv->provided_clock);
+    if (aclock->handle) {
+      mediasync_wrap_GetMediaTimeByType(aclock->handle, MEDIA_STC_TIME, MEDIASYNC_UNIT_US, cur);
+      if (*cur < 0) {
+        *cur = 0;
+      }
+      *cur = gst_util_uint64_scale_int(*cur, GST_SECOND, GST_MSECOND);
+    }
+  } else {
+    rc = avsync_get_time(sink, &pcr);
+    if (rc)
         return FALSE;
-    }
-    return TRUE;
-  }
 
-  rc = avsync_get_time(sink, &pcr);
-  if (rc)
-      return FALSE;
-
-  if (pcr == -1) {
-    if (priv->paused_ && priv->last_pcr != -1) {
-      pcr = priv->last_pcr;
-      GST_LOG_OBJECT (sink, "paused, return last %u", pcr);
-    } else {
-      pcr = priv->first_pts;
-      GST_LOG_OBJECT (sink, "render not start, set to first_pts %u", pcr);
-    }
-  } else if (priv->first_pts_set && (int)(priv->first_pts - pcr) > 0 &&
+    if (pcr == -1) {
+      if (priv->paused_ && priv->last_pcr != -1) {
+        pcr = priv->last_pcr;
+        GST_LOG_OBJECT (sink, "paused, return last %u", pcr);
+      } else {
+        pcr = priv->first_pts;
+        GST_LOG_OBJECT (sink, "render not start, set to first_pts %u", pcr);
+      }
+    } else if (priv->first_pts_set && (int)(priv->first_pts - pcr) > 0 &&
                 (int)(priv->first_pts - pcr) < 90000 &&
                 priv->sync_mode == AV_SYNC_MODE_AMASTER) {
-    pcr = priv->first_pts;
-    GST_LOG_OBJECT (sink, "render start with delay, set to first_pts %u", pcr);
-  }
-
-  if (priv->sync_mode != AV_SYNC_MODE_PCR_MASTER) {
-    gint64 timepassed2, diff;
-
-    /* for live streaming need to consider PTS wrapping */
-    if (priv->last_pcr != -1 && priv->last_pcr > 0xFFFF0000 && pcr < 10*PTS_90K) {
-      priv->wrapping_time++;
-      GST_INFO_OBJECT (sink, "pts wrapping num: %d", priv->wrapping_time);
+      pcr = priv->first_pts;
+      GST_LOG_OBJECT (sink, "render start with delay, set to first_pts %u", pcr);
     }
-    if (pcr != -1)
-      priv->last_pcr = pcr;
 
-    if (!priv->wrapping_time)
-      timepassed_90k = pcr - priv->first_pts;
-    else
-      timepassed_90k = (int)(pcr - priv->first_pts) + priv->wrapping_time * 0xFFFFFFFFLL;
+    if (priv->sync_mode != AV_SYNC_MODE_PCR_MASTER) {
+      gint64 timepassed2, diff;
 
-    timepassed = gst_util_uint64_scale_int (timepassed_90k, GST_SECOND, PTS_90K);
-    *cur = priv->first_pts_64 + timepassed;
+      /* for live streaming need to consider PTS wrapping */
+      if (priv->last_pcr != -1 && priv->last_pcr > 0xFFFF0000 && pcr < 10*PTS_90K) {
+        priv->wrapping_time++;
+        GST_INFO_OBJECT (sink, "pts wrapping num: %d", priv->wrapping_time);
+      }
+      if (pcr != -1)
+        priv->last_pcr = pcr;
 
-    if (priv->eos_time != -1) {
+      if (!priv->wrapping_time)
+        timepassed_90k = pcr - priv->first_pts;
+      else
+        timepassed_90k = (int)(pcr - priv->first_pts) + priv->wrapping_time * 0xFFFFFFFFLL;
+
+      timepassed = gst_util_uint64_scale_int (timepassed_90k, GST_SECOND, PTS_90K);
+      *cur = priv->first_pts_64 + timepassed;
+
+      if (priv->eos_time != -1) {
         timepassed2 = priv->eos_time - priv->first_pts_64;
         diff = (timepassed2 > timepassed)?
             (timepassed2 - timepassed):(timepassed - timepassed2);
@@ -857,10 +851,11 @@ get_position (GstAmlHalAsink* sink, GstFormat format, gint64 * cur)
               timepassed, timepassed2);
           *cur = timepassed2;
         }
+      }
+    } else {
+      timepassed = gst_util_uint64_scale_int (pcr, GST_SECOND, PTS_90K);
+      *cur = timepassed;
     }
-  } else {
-    timepassed = gst_util_uint64_scale_int (pcr, GST_SECOND, PTS_90K);
-    *cur = timepassed;
   }
 
   GST_LOG_OBJECT (sink, "POSITION: %lld pcr: %u wrapping: %d",
@@ -1539,9 +1534,9 @@ parse_caps (GstAudioRingBufferSpec * spec, GstCaps * caps)
     spec->type = GST_AUDIO_FORMAT_TYPE_LPCM_PRIV2;
     info.bpf = 1;
   }   else if (g_str_equal (mimetype, "audio/x-private-ts-lpcm")) {
-    if (!(gst_structure_get_int (structure, "rate", &info.rate)))
+    if (!(gst_structure_get_int (structure, "rate", &info.rate)) || info.rate <= 0)
         info.rate = 48000;
-    if (!gst_structure_get_int (structure, "channels", &info.channels))
+    if (!gst_structure_get_int (structure, "channels", &info.channels) || info.channels <= 0)
         info.channels = 2;
     spec->type = GST_AUDIO_FORMAT_TYPE_LPCM_TS;
     info.bpf = 1;
@@ -1607,7 +1602,6 @@ static gboolean gst_aml_hal_asink_setcaps (GstAmlHalAsink* sink,
 
   /* release old ringbuffer */
   GST_OBJECT_LOCK (sink);
-  hal_pause (sink);
   hal_release (sink);
   priv->flushing_ = FALSE;
   GST_OBJECT_UNLOCK (sink);
@@ -1747,6 +1741,11 @@ static GstClockReturn sink_wait_clock (GstAmlHalAsink * sink,
   }
 
   do {
+    if (priv->flushing_) {
+      GST_INFO_OBJECT (sink, "we are flusing, do not wait");
+      ret = GST_CLOCK_OK;
+      break;
+    }
     now = gst_aml_hal_asink_get_time (clock, sink);
     if (now == GST_CLOCK_TIME_NONE) {
       ret = GST_CLOCK_UNSCHEDULED;
@@ -1875,7 +1874,10 @@ static int update_avsync_speed(GstAmlHalAsink *sink, float rate)
   if (rate == priv->rate)
     return 0;
 
-  if (priv->avsync)
+  GstAmlClock *aclock = GST_AML_CLOCK_CAST(priv->provided_clock);
+  if (gst_aml_clock_get_clock_type(priv->provided_clock) == GST_AML_CLOCK_TYPE_MEDIASYNC) {
+    rc = mediasync_wrap_setPlaybackRate(aclock->handle, rate);
+  } else if (priv->avsync)
     rc = av_sync_set_speed(priv->avsync, rate);
 
   if (!rc)
@@ -1887,10 +1889,24 @@ static int update_avsync_speed(GstAmlHalAsink *sink, float rate)
 
 static int create_av_sync(GstAmlHalAsink *sink)
 {
+  int ret = 0;
   GstAmlHalAsinkPrivate *priv = sink->priv;
 
-#ifndef MEDIA_SYNC
-  if (!priv->avsync && priv->direct_mode_) {
+  if (priv->direct_mode_ && gst_aml_clock_get_clock_type(priv->provided_clock) == GST_AML_CLOCK_TYPE_MEDIASYNC) {
+    char id_setting[20] = {0};
+    char type_setting[20] = {0};
+    g_mutex_lock(&priv->feed_lock);
+    snprintf(type_setting, sizeof(type_setting), "hw_av_sync_type=%d", GST_AML_CLOCK_TYPE_MEDIASYNC);
+    snprintf(id_setting, sizeof(id_setting), "hw_av_sync=%d", priv->session_id);
+    if (priv->stream_) {
+      priv->stream_->common.set_parameters (&priv->stream_->common, type_setting);
+      priv->stream_->common.set_parameters (&priv->stream_->common, id_setting);
+    } else {
+      GST_ERROR_OBJECT (sink, "no stream opened");
+      ret = -1;
+    }
+    g_mutex_unlock(&priv->feed_lock);
+  } else if (!priv->avsync && priv->direct_mode_) {
     char id_setting[20] = {0};
     char type_setting[20] = {0};
     struct start_policy policy;
@@ -1900,12 +1916,14 @@ static int create_av_sync(GstAmlHalAsink *sink)
       return 0;
 #endif
 
+    g_mutex_lock(&priv->feed_lock);
     if (priv->seamless_switch || priv->sync_mode == AV_SYNC_MODE_PCR_MASTER) {
       priv->avsync = av_sync_attach (priv->session_id, AV_SYNC_TYPE_AUDIO);
     } else {
       priv->avsync = av_sync_create (priv->session_id, priv->sync_mode, AV_SYNC_TYPE_AUDIO, 0);
     }
     if (!priv->avsync) {
+      g_mutex_unlock(&priv->feed_lock);
       GST_ERROR_OBJECT (sink, "create av sync fail");
       return -1;
     }
@@ -1924,29 +1942,27 @@ static int create_av_sync(GstAmlHalAsink *sink)
       avs_sync_set_start_policy (priv->avsync, &policy);
     }
     /* set session into hwsync id */
-    g_mutex_lock(&priv->feed_lock);
-    snprintf(type_setting, sizeof(type_setting), "hw_av_sync_type=%d", AV_SYNC_TYPE_MSYNC);
+    snprintf(type_setting, sizeof(type_setting), "hw_av_sync_type=%d", GST_AML_CLOCK_TYPE_MSYNC);
     snprintf(id_setting, sizeof(id_setting), "hw_av_sync=%d", priv->session_id);
-    priv->stream_->common.set_parameters (&priv->stream_->common, type_setting);
-    priv->stream_->common.set_parameters (&priv->stream_->common, id_setting);
+    if (priv->stream_) {
+      priv->stream_->common.set_parameters (&priv->stream_->common, type_setting);
+      priv->stream_->common.set_parameters (&priv->stream_->common, id_setting);
+    } else {
+      if (priv->avsync) {
+        void *tmp = priv->avsync;
+        g_atomic_pointer_set (&priv->avsync, NULL);
+        av_sync_destroy(tmp);
+      }
+      GST_ERROR_OBJECT (sink, "no stream opened");
+      ret = -1;
+    }
     g_mutex_unlock(&priv->feed_lock);
   } else {
     GST_INFO_OBJECT (sink, "no need to create av sync, direct: %d",
         priv->direct_mode_);
   }
-#else
-  if (priv->direct_mode_) {
-    char id_setting[20] = {0};
-    char type_setting[20] = {0};
-    g_mutex_lock(&priv->feed_lock);
-    snprintf(type_setting, sizeof(type_setting), "hw_av_sync_type=%d", AV_SYNC_TYPE_MEDIASYNC);
-    snprintf(id_setting, sizeof(id_setting), "hw_av_sync=%d", priv->session_id);
-    priv->stream_->common.set_parameters (&priv->stream_->common, type_setting);
-    priv->stream_->common.set_parameters (&priv->stream_->common, id_setting);
-    g_mutex_unlock(&priv->feed_lock);
-  }
-#endif
-  return 0;
+
+  return ret;
 }
 
 static gboolean
@@ -1995,6 +2011,9 @@ gst_aml_hal_asink_event (GstAmlHalAsink *sink, GstEvent * event)
       priv->received_eos = FALSE;
       priv->flushing_ = TRUE;
       priv->quit_clock_wait = TRUE;
+      /* unblock audio HAL wait */
+      if (priv->avsync)
+        avs_sync_stop_audio (priv->avsync);
       /* unblock hal_commit() */
       g_mutex_lock(&priv->feed_lock);
       g_cond_signal (&priv->run_ready);
@@ -2030,6 +2049,12 @@ gst_aml_hal_asink_event (GstAmlHalAsink *sink, GstEvent * event)
     case GST_EVENT_SEGMENT:
     {
       GstSegment segment;
+
+      if (GST_STATE(sink) <= GST_STATE_READY) {
+        GST_WARNING_OBJECT (sink, "segment event in wrong state %d", GST_STATE(sink));
+        break;
+      }
+
       gst_event_copy_segment (event, &segment);
       GST_DEBUG_OBJECT (sink, "configured segment %" GST_SEGMENT_FORMAT,
               &segment);
@@ -2037,10 +2062,6 @@ gst_aml_hal_asink_event (GstAmlHalAsink *sink, GstEvent * event)
       if (segment.start != GST_CLOCK_TIME_NONE) {
         GstMessage *seg_rec;
 
-        if (priv->segment.rate != 0.0 && priv->segment.rate != segment.rate) {
-          GST_INFO_OBJECT (sink, "ignore rate %f keep %f", segment.rate, priv->segment.rate);
-          segment.rate = priv->segment.rate;
-        }
         priv->segment = segment;
         priv->render_samples = 0;
         seg_rec = gst_message_new_info_with_details (GST_OBJECT_CAST (sink),
@@ -2314,41 +2335,41 @@ static gpointer xrun_thread(gpointer para)
     }
     if (!priv->xrun_paused &&
            g_timer_elapsed(priv->xrun_timer, NULL) > 0.4) {
-#ifdef ENABLE_MS12
-      char *status = priv->hw_dev_->get_parameters (priv->hw_dev_,
-              "main_input_underrun");
-      int underrun = 0;
+      if (priv->ms12_enable) {
+        char *status = priv->hw_dev_->get_parameters (priv->hw_dev_,
+            "main_input_underrun");
+        int underrun = 0;
 
-      if (status) {
-        sscanf(status,"main_input_underrun=%d", &underrun);
-        free (status);
-      }
-
-      if (!underrun) {
-        usleep(10000);
-        continue;
-      }
-      if (priv->received_eos) {
-        GST_INFO_OBJECT (sink, "xrun timer reached EOS");
-        GST_OBJECT_LOCK (sink);
-        priv->eos = TRUE;
-        GST_OBJECT_UNLOCK (sink);
-      } else {
-        if (!priv->disable_xrun) {
-          hal_pause (sink);
-          GST_INFO_OBJECT (sink, "xrun timer triggered pause audio");
+        if (status) {
+          sscanf(status,"main_input_underrun=%d", &underrun);
+          free (status);
         }
+
+        if (!underrun) {
+          usleep(10000);
+          continue;
+        }
+        if (priv->received_eos) {
+          GST_INFO_OBJECT (sink, "xrun timer reached EOS");
+          GST_OBJECT_LOCK (sink);
+          priv->eos = TRUE;
+          GST_OBJECT_UNLOCK (sink);
+        } else {
+          if (!priv->disable_xrun) {
+            hal_pause (sink);
+            GST_INFO_OBJECT (sink, "xrun timer triggered pause audio");
+          }
+          g_signal_emit (G_OBJECT (sink), g_signals[SIGNAL_XRUN], 0, 0, NULL);
+          GST_WARNING_OBJECT (sink, "xrun signaled");
+        }
+        g_timer_start(priv->xrun_timer);
+        g_timer_stop(priv->xrun_timer);
+      } else {
+        GST_INFO_OBJECT (sink, "xrun timer triggered pause audio");
+        hal_pause (sink);
+        priv->xrun_paused = true;
         g_signal_emit (G_OBJECT (sink), g_signals[SIGNAL_XRUN], 0, 0, NULL);
-        GST_WARNING_OBJECT (sink, "xrun signaled");
       }
-      g_timer_start(priv->xrun_timer);
-      g_timer_stop(priv->xrun_timer);
-#else
-      GST_INFO_OBJECT (sink, "xrun timer triggered pause audio");
-      hal_pause (sink);
-      priv->xrun_paused = true;
-      g_signal_emit (G_OBJECT (sink), g_signals[SIGNAL_XRUN], 0, 0, NULL);
-#endif
     }
     usleep(50000);
   }
@@ -2412,7 +2433,7 @@ gst_aml_hal_asink_render (GstAmlHalAsink * sink, GstBuffer * buf)
   }
 
   if (G_UNLIKELY (!priv->stream_))
-    goto wrong_state;
+    goto lost_resource;
 
   if (G_UNLIKELY (priv->received_eos))
     goto was_eos;
@@ -2468,10 +2489,16 @@ gst_aml_hal_asink_render (GstAmlHalAsink * sink, GstBuffer * buf)
 
   time = GST_BUFFER_TIMESTAMP (buf);
 
+  if ((!GST_CLOCK_TIME_IS_VALID (time) && !priv->first_pts_set) && priv->direct_mode_) {
+    GST_INFO_OBJECT (sink, "discard frame wo/ pts at beginning");
+    goto done;
+  }
   if ((!GST_CLOCK_TIME_IS_VALID (time) ||
       (priv->last_ts != GST_CLOCK_TIME_NONE && priv->last_ts == time)) &&
       is_raw_type(priv->spec.type)) {
-    time = gst_util_uint64_scale_int(priv->render_samples, GST_SECOND, rate);
+    time = priv->first_pts_64;
+    time += gst_util_uint64_scale_int(priv->render_samples, GST_SECOND, rate);
+    GST_BUFFER_TIMESTAMP (buf) = time;
     GST_LOG_OBJECT (sink, "fake time %" GST_TIME_FORMAT, GST_TIME_ARGS (time));
   }
 
@@ -2564,7 +2591,11 @@ gst_aml_hal_asink_render (GstAmlHalAsink * sink, GstBuffer * buf)
   g_mutex_lock(&priv->feed_lock);
   /* blocked on paused */
   while (priv->paused_ && !priv->flushing_)
-    g_cond_wait (&priv->run_ready, &priv->feed_lock);
+  {
+      GST_PAD_STREAM_UNLOCK(GST_BASE_SINK_PAD(sink));
+      g_cond_wait (&priv->run_ready, &priv->feed_lock);
+      GST_PAD_STREAM_LOCK(GST_BASE_SINK_PAD(sink));
+  }
 
   if (!priv->stream_)
     goto commit_done;
@@ -2576,6 +2607,7 @@ gst_aml_hal_asink_render (GstAmlHalAsink * sink, GstBuffer * buf)
     GST_DEBUG_OBJECT (sink, "interrupted by stop");
     gst_buffer_unmap (buf, &info);
     g_mutex_unlock(&priv->feed_lock);
+    ret = GST_FLOW_FLUSHING;
     goto done;
   }
 
@@ -2711,11 +2743,10 @@ out_of_segment:
     ret = GST_FLOW_OK;
     goto done;
   }
-wrong_state:
+lost_resource:
   {
-    GST_DEBUG_OBJECT (sink, "not negotiated");
-    GST_ELEMENT_ERROR (sink, STREAM, FORMAT, (NULL), ("sink not negotiated."));
-    ret = GST_FLOW_NOT_NEGOTIATED;
+    GST_DEBUG_OBJECT (sink, "lost resource");
+    ret = GST_FLOW_OK;
     goto done;
   }
 wrong_size:
@@ -2796,11 +2827,11 @@ static void resMgrNotify(EssRMgr *rm, int event, int type, int id, void* userDat
           GST_DEBUG_OBJECT (sink, "done releasing audio decoder %d", id);
           break;
         }
+        case EssRMgrEvent_granted:
         default:
         break;
       }
     }
-    case EssRMgrEvent_granted:
     default:
       break;
   }
@@ -2951,14 +2982,13 @@ gst_aml_hal_asink_change_state (GstElement * element,
       break;
     }
     case GST_STATE_CHANGE_PAUSED_TO_READY:
-    {
-      GST_INFO_OBJECT(sink, "paused to ready");
-      paused_to_ready (sink);
-#ifdef ESSOS_RM
-      resMgrUpdateState(priv, EssRMgrRes_idle);
-#endif
+      // unblock _render and upstream
+      // original code here has to place below parent change_state (avoid race condtion)
+      g_mutex_lock(&priv->feed_lock);
+      priv->flushing_ = TRUE;
+      g_cond_signal(&priv->run_ready);
+      g_mutex_unlock(&priv->feed_lock);
       break;
-    }
     default:
       break;
   }
@@ -2968,6 +2998,15 @@ gst_aml_hal_asink_change_state (GstElement * element,
   switch (transition) {
     case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
       break;
+    case GST_STATE_CHANGE_PAUSED_TO_READY:
+    {
+      GST_INFO_OBJECT(sink, "paused to ready");
+      paused_to_ready (sink);
+#ifdef ESSOS_RM
+      resMgrUpdateState(priv, EssRMgrRes_idle);
+#endif
+      break;
+    }
     case GST_STATE_CHANGE_READY_TO_NULL:
       GST_INFO_OBJECT(sink, "ready to null");
       GST_OBJECT_LOCK (sink);
@@ -3018,7 +3057,8 @@ open_failed:
 /* open the device with given specs */
 static gboolean gst_aml_hal_asink_open (GstAmlHalAsink* sink)
 {
-  int ret;
+  int ret, val = 0;
+  char *status;
   GstAmlHalAsinkPrivate *priv = sink->priv;
 
   GST_DEBUG_OBJECT (sink, "open");
@@ -3027,7 +3067,17 @@ static gboolean gst_aml_hal_asink_open (GstAmlHalAsink* sink)
     GST_ERROR_OBJECT(sink, "fail to load hw:%d", ret);
     return FALSE;
   }
-  GST_DEBUG_OBJECT (sink, "load hw done");
+
+  status = priv->hw_dev_->get_parameters (priv->hw_dev_,
+      "dolby_ms12_enable");
+
+  if (status) {
+    sscanf(status,"dolby_ms12_enable=%d", &val);
+    priv->ms12_enable = val;
+    free (status);
+    GST_DEBUG_OBJECT (sink, "load hw done ms12: %d", val);
+  }
+
   return TRUE;
 }
 
@@ -3433,21 +3483,27 @@ static gboolean hal_stop (GstAmlHalAsink * sink)
     return FALSE;
   }
 
+  /* unblock audio HAL wait */
+  if (priv->avsync)
+    avs_sync_stop_audio (priv->avsync);
+
   g_mutex_lock (&priv->feed_lock);
   priv->flushing_ = TRUE;
   g_cond_signal (&priv->run_ready);
-  g_mutex_unlock (&priv->feed_lock);
   GST_DEBUG_OBJECT (sink, "stop");
 
   if (priv->avsync) {
+    void *tmp;
     /* if session is still alive, recover mode for next playback */
     if (priv->sync_mode == AV_SYNC_MODE_PCR_MASTER) {
       GST_INFO_OBJECT(sink, "recover avsync mode");
       av_sync_change_mode (priv->avsync, AV_SYNC_MODE_PCR_MASTER);
     }
-    av_sync_destroy (priv->avsync);
-    priv->avsync = NULL;
+    tmp = priv->avsync;
+    g_atomic_pointer_set (&priv->avsync, NULL);
+    av_sync_destroy (tmp);
   }
+  g_mutex_unlock (&priv->feed_lock);
 
   return TRUE;
 }
